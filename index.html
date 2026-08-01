@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moteur TLKB</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 antialiased min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        function App() {
+            const [isLoggedIn, setIsLoggedIn] = useState(false);
+            const [email, setEmail] = useState('');
+            const [password, setPassword] = useState('');
+            const [isSignUp, setIsSignUp] = useState(false);
+            const [fiches, setFiches] = useState([
+                { id: '1', titre: 'Introduction au Moteur TLKB', contenu: 'Structure unifiée pour la gestion des connaissances et des flux de données.' },
+                { id: '2', titre: 'Protocole de Sécurité', contenu: 'Isolation des environnements et validation stricte des déploiements.' }
+            ]);
+            const [searchQuery, setSearchQuery] = useState('');
+            const [notification, setNotification] = useState('Système opérationnel.');
+
+            useEffect(() => {
+                const timer = setTimeout(() => setNotification(null), 4000);
+                return () => clearTimeout(timer);
+            }, [notification]);
+
+            const handleAuth = (e) => {
+                e.preventDefault();
+                setIsLoggedIn(true);
+                setNotification("Authentification réussie.");
+            };
+
+            const handleLogout = () => {
+                setIsLoggedIn(false);
+                setNotification("Session fermée.");
+            };
+
+            const addFiche = () => {
+                const nouvelleFiche = {
+                    id: Date.now().toString(),
+                    titre: `Nouvelle Fiche #${fiches.length + 1}`,
+                    contenu: 'Saisissez ici le contenu stratégique de votre fiche...'
+                };
+                setFiches([nouvelleFiche, ...fiches]);
+                setNotification("Fiche ajoutée avec succès.");
+            };
+
+            const deleteFiche = (id) => {
+                setFiches(fiches.filter(f => f.id !== id));
+                setNotification("Fiche supprimée.");
+            };
+
+            const filteredFiches = fiches.filter(f => 
+                f.titre.toLowerCase().includes(searchQuery.toLowerCase()) || 
+                f.contenu.toLowerCase().includes(searchQuery.toLowerCase())
+            );
+
+            return (
+                <div className="min-h-screen p-4 md:p-8 flex flex-col">
+                    {notification && (
+                        <div className="fixed top-4 right-4 bg-indigo-600 text-white px-4 py-3 rounded-xl shadow-lg z-50 text-sm font-medium transition-all animate-bounce">
+                            {notification}
+                        </div>
+                    )}
+
+                    <header className="max-w-4xl w-full mx-auto bg-white p-4 md:p-6 rounded-2xl shadow-sm border border-slate-100 flex justify-between items-center mb-8">
+                        <div>
+                            <h1 className="text-xl font-bold text-slate-900 tracking-tight">Moteur TLKB</h1>
+                            <p className="text-xs text-slate-500">Architecture unifiée et souveraine</p>
+                        </div>
+                        {isLoggedIn && (
+                            <button 
+                                onClick={handleLogout}
+                                className="bg-rose-50 text-rose-600 hover:bg-rose-100 px-4 py-2 rounded-xl text-sm font-semibold transition-colors">
+                                Déconnexion
+                            </button>
+                        )}
+                    </header>
+
+                    <main className="max-w-4xl w-full mx-auto flex-grow">
+                        {!isLoggedIn ? (
+                            <div className="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 max-w-md mx-auto mt-12">
+                                <h2 className="text-2xl font-bold text-slate-800 mb-6 text-center">Connexion requise</h2>
+                                <form onSubmit={handleAuth} className="space-y-4">
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-600 uppercase mb-1">E-mail</label>
+                                        <input 
+                                            type="email" 
+                                            required
+                                            value={email}
+                                            onChange={(e) => setEmail(e.target.value)}
+                                            className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                                            placeholder="nom@exemple.com"
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-600 uppercase mb-1">Mot de passe</label>
+                                        <input 
+                                            type="password" 
+                                            required
+                                            value={password}
+                                            onChange={(e) => setPassword(e.target.value)}
+                                            className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                                            placeholder="••••••••"
+                                        />
+                                    </div>
+                                    <button 
+                                        type="submit"
+                                        className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition-all shadow-md shadow-indigo-100 text-sm">
+                                        {isSignUp ? "Créer un compte" : "Se connecter"}
+                                    </button>
+                                </form>
+                                <button 
+                                    onClick={() => setIsSignUp(!isSignUp)}
+                                    className="w-full text-center text-xs text-indigo-600 hover:underline mt-4 font-medium">
+                                    {isSignUp ? "Déjà un compte ? Se connecter" : "Besoin d'un compte ? S'inscrire"}
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="space-y-6">
+                                <div className="flex flex-col sm:flex-row justify-between items-center gap-4 bg-white p-4 rounded-2xl border border-slate-100 shadow-sm">
+                                    <input 
+                                        type="text"
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                        placeholder="Rechercher dans les fiches..."
+                                        className="w-full sm:w-80 px-4 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+                                    />
+                                    <button 
+                                        onClick={addFiche}
+                                        className="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-md shadow-indigo-100">
+                                        + Nouvelle fiche
+                                    </button>
+                                </div>
+
+                                <div className="grid gap-4">
+                                    {filteredFiches.length === 0 ? (
+                                        <div className="bg-white p-12 rounded-2xl border border-slate-100 text-center text-slate-400">
+                                            Aucune fiche correspondante trouvée.
+                                        </div>
+                                    ) : (
+                                        filteredFiches.map((fiche) => (
+                                            <div key={fiche.id} className="bg-white p-6 rounded-2xl border border-slate-100 shadow-sm flex flex-col justify-between hover:shadow-md transition-shadow">
+                                                <div>
+                                                    <h3 className="text-lg font-bold text-slate-800 mb-2">{fiche.titre}</h3>
+                                                    <p className="text-slate-600 text-sm leading-relaxed mb-4">{fiche.contenu}</p>
+                                                </div>
+                                                <div className="flex justify-end">
+                                                    <button 
+                                                        onClick={() => deleteFiche(fiche.id)}
+                                                        className="text-rose-600 hover:bg-rose-50 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors">
+                                                        Supprimer
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
