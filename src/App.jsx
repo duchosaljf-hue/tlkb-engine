@@ -109,6 +109,24 @@ export default function App() {
   const [userInput, setUserInput] = useState('');
   const [feedback, setFeedback] = useState(null);
   const [cycle, setCycle] = useState(0);
+  const [dailyNewLimit, setDailyNewLimit] = useState(() => {
+    const saved = localStorage.getItem('tlkb_daily_new_limit');
+    return saved ? parseInt(saved, 10) : 10;
+  });
+  const [noMoreToday, setNoMoreToday] = useState(false);
+
+  const updateDailyLimit = (val) => {
+    const n = Math.max(1, parseInt(val, 10) || 10);
+    setDailyNewLimit(n);
+    localStorage.setItem('tlkb_daily_new_limit', String(n));
+  };
+
+  const isToday = (ts) => {
+    if (!ts) return false;
+    const d = new Date(ts);
+    const now = new Date();
+    return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  };
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => { setUser(u); setAuthLoading(false); });
@@ -174,10 +192,13 @@ export default function App() {
 
   const getNextCard = useCallback(() => {
     const now = Date.now();
+    const newToday = cards.filter((c) => isToday(c.firstSeenAt)).length;
+    const capReached = newToday >= dailyNewLimit;
+
     const discovery = cards.filter((c) => (c.level || 0) === 0);
     const revision = cards.filter((c) => (c.level || 0) > 0 && (c.nextReview || 0) <= now);
 
-    const eligibleDiscovery = discovery.filter((c) => {
+    const eligibleDiscovery = capReached ? [] : discovery.filter((c) => {
       if (!c.prerequis) return true;
       return c.prerequis.split(';').filter(Boolean).every((id) => {
         const req = cards.find((x) => x.id === id);
@@ -197,12 +218,18 @@ export default function App() {
     else if (revision.length) { next = revision[0]; setCycle((c) => c + 1); }
     else if (eligibleDiscovery.length) { next = eligibleDiscovery[0]; setCycle(0); }
 
-    if (!next) { setCurrentCard(null); setMode(null); return; }
+    if (!next) {
+      setCurrentCard(null);
+      setMode(null);
+      setNoMoreToday(capReached && discovery.length > 0);
+      return;
+    }
+    setNoMoreToday(false);
     setCurrentCard(next);
     setMode((next.level || 0) === 0 ? 'lesson' : null);
     setFeedback(null);
     setUserInput('');
-  }, [cards, cycle]);
+  }, [cards, cycle, dailyNewLimit]);
 
   const saveCard = async (updated) => {
     const ref = collection(db, 'users', user.uid, 'cards');
@@ -211,7 +238,7 @@ export default function App() {
   };
 
   const acknowledgeLesson = async () => {
-    const updated = { ...currentCard, level: 1, confidence: 20, nextReview: Date.now() + 86400000 };
+    const updated = { ...currentCard, level: 1, confidence: 20, nextReview: Date.now() + 86400000, firstSeenAt: Date.now() };
     await saveCard(updated);
     setFeedback({ success: true, isLesson: true, message: 'Notion intégrée au cycle de révision.' });
     setMode('feedback');
@@ -310,6 +337,7 @@ export default function App() {
             const avgConf = started
               ? Math.round(cards.filter((c) => (c.level || 0) > 0).reduce((sum, c) => sum + (c.confidence || 0), 0) / started)
               : 0;
+            const newToday = cards.filter((c) => isToday(c.firstSeenAt)).length;
             return (
               <div style={s.card}>
                 <h3 style={{ marginTop: 0 }}>Progression</h3>
@@ -331,9 +359,31 @@ export default function App() {
                     <div style={{ fontSize: 11, color: '#64748b' }}>confiance moy.</div>
                   </div>
                 </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 16, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
+                  <label style={{ fontSize: 13, color: '#475569', flex: 1 }}>
+                    Nouvelles leçons max. par jour
+                    <span style={{ color: '#94a3b8' }}> ({newToday}/{dailyNewLimit} aujourd'hui)</span>
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={dailyNewLimit}
+                    onChange={(e) => updateDailyLimit(e.target.value)}
+                    style={{ width: 64, padding: '6px 8px', borderRadius: 8, border: '1px solid #cbd5e1', textAlign: 'center' }}
+                  />
+                </div>
               </div>
             );
           })()}
+
+          {noMoreToday && (
+            <div style={{ ...s.card, background: '#f0fdf4', textAlign: 'center' }}>
+              <h3 style={{ marginTop: 0, color: '#16a34a' }}>Quota de nouvelles leçons atteint pour aujourd'hui</h3>
+              <p style={{ color: '#475569', fontSize: 14 }}>
+                Revenez demain pour de nouvelles découvertes, ou augmentez la limite ci-dessus.
+              </p>
+            </div>
+          )}
 
           <div style={s.card}>
             <h3 style={{ marginTop: 0 }}>Import CSV (schéma 19 colonnes)</h3>
