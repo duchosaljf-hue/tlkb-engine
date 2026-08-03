@@ -14,6 +14,7 @@ import {
   collection,
   doc,
   setDoc,
+  deleteDoc,
   onSnapshot,
 } from 'firebase/firestore';
 
@@ -79,7 +80,16 @@ function parseCsv(text) {
   }).filter(Boolean);
 }
 
-// ---- Styles (inline, no build-step CSS dependency) ----
+// ---- Spaced repetition engine (Anki-style SM-2 with same-day learning steps) ----
+const LEARNING_STEPS_MIN = [10, 1440]; // 10 minutes, then 1 day, before graduating
+const DEFAULT_EASE = 2.5;
+const MIN_EASE = 1.3;
+const MATURE_DAYS = 21; // Anki's definition of a "mature" card
+
+function dateKey(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
 const s = {
   page: { minHeight: '100vh', background: '#f8fafc', color: '#0f172a', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', padding: '20px', paddingBottom: '80px', boxSizing: 'border-box' },
   card: { background: '#fff', borderRadius: 16, border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', padding: 24, maxWidth: 720, margin: '0 auto 20px auto' },
@@ -104,7 +114,7 @@ export default function App() {
   const [importMsg, setImportMsg] = useState('');
 
   const [currentCard, setCurrentCard] = useState(null);
-  const [mode, setMode] = useState(null); // 'lesson' | null | 'qcm' | 'input' | 'feedback'
+  const [mode, setMode] = useState(null); // 'lesson' | null | 'qcm' | 'input' | 'grade' | 'feedback'
   const [qcmOptions, setQcmOptions] = useState([]);
   const [userInput, setUserInput] = useState('');
   const [feedback, setFeedback] = useState(null);
@@ -181,6 +191,20 @@ export default function App() {
 
   const handleImport = () => importText(rawCsv);
 
+  const handleDeleteAll = async () => {
+    if (!user || cards.length === 0) return;
+    const sure = window.confirm(`Supprimer définitivement les ${cards.length} fiches actuelles ? Cette action est irréversible.`);
+    if (!sure) return;
+    const confirmAgain = window.confirm('Confirmez une seconde fois : toutes les fiches et leur progression seront perdues.');
+    if (!confirmAgain) return;
+    setImportMsg('Suppression en cours…');
+    const ref = collection(db, 'users', user.uid, 'cards');
+    for (const card of cards) {
+      await deleteDoc(doc(ref, card.id));
+    }
+    setImportMsg('Toutes les fiches ont été supprimées. Vous pouvez importer un nouveau fichier.');
+  };
+
   const handleFileImport = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -195,14 +219,15 @@ export default function App() {
     const newToday = cards.filter((c) => isToday(c.firstSeenAt)).length;
     const capReached = newToday >= dailyNewLimit;
 
-    const discovery = cards.filter((c) => (c.level || 0) === 0);
-    const revision = cards.filter((c) => (c.level || 0) > 0 && (c.nextReview || 0) <= now);
+    const brandNew = cards.filter((c) => !c.firstSeenAt);
+    const learningDue = cards.filter((c) => c.firstSeenAt && typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length && (c.nextReview || 0) <= now);
+    const reviewDue = cards.filter((c) => c.firstSeenAt && (c.learningStep === undefined || c.learningStep === null) && (c.nextReview || 0) <= now);
 
-    const eligibleDiscovery = capReached ? [] : discovery.filter((c) => {
+    const eligibleNew = capReached ? [] : brandNew.filter((c) => {
       if (!c.prerequis) return true;
       return c.prerequis.split(';').filter(Boolean).every((id) => {
         const req = cards.find((x) => x.id === id);
-        return req && (req.level || 0) >= 1;
+        return req && req.firstSeenAt;
       });
     }).sort((a, b) => {
       const pa = (parseInt(a.utilite) || 3) * 2 + (6 - (parseInt(a.difficulte) || 3));
@@ -210,23 +235,27 @@ export default function App() {
       return pb - pa;
     });
 
-    revision.sort((a, b) => (a.confidence || 0) - (b.confidence || 0));
+    reviewDue.sort((a, b) => (a.efactor || DEFAULT_EASE) - (b.efactor || DEFAULT_EASE));
 
     let next = null;
-    const wantDiscovery = cycle >= 4;
-    if (wantDiscovery && eligibleDiscovery.length) { next = eligibleDiscovery[0]; setCycle(0); }
-    else if (revision.length) { next = revision[0]; setCycle((c) => c + 1); }
-    else if (eligibleDiscovery.length) { next = eligibleDiscovery[0]; setCycle(0); }
+    if (learningDue.length) {
+      next = learningDue[0];
+    } else {
+      const wantNew = cycle >= 4;
+      if (wantNew && eligibleNew.length) { next = eligibleNew[0]; setCycle(0); }
+      else if (reviewDue.length) { next = reviewDue[0]; setCycle((c) => c + 1); }
+      else if (eligibleNew.length) { next = eligibleNew[0]; setCycle(0); }
+    }
 
     if (!next) {
       setCurrentCard(null);
       setMode(null);
-      setNoMoreToday(capReached && discovery.length > 0);
+      setNoMoreToday(capReached && brandNew.length > 0);
       return;
     }
     setNoMoreToday(false);
     setCurrentCard(next);
-    setMode((next.level || 0) === 0 ? 'lesson' : null);
+    setMode(!next.firstSeenAt ? 'lesson' : null);
     setFeedback(null);
     setUserInput('');
   }, [cards, cycle, dailyNewLimit]);
@@ -238,9 +267,18 @@ export default function App() {
   };
 
   const acknowledgeLesson = async () => {
-    const updated = { ...currentCard, level: 1, confidence: 20, nextReview: Date.now() + 86400000, firstSeenAt: Date.now() };
+    const updated = {
+      ...currentCard,
+      firstSeenAt: Date.now(),
+      learningStep: 0,
+      nextReview: Date.now() + LEARNING_STEPS_MIN[0] * 60000,
+      efactor: currentCard.efactor || DEFAULT_EASE,
+      interval: 0,
+      totalReviews: currentCard.totalReviews || 0,
+    };
     await saveCard(updated);
-    setFeedback({ success: true, isLesson: true, message: 'Notion intégrée au cycle de révision.' });
+    const stepLabel = LEARNING_STEPS_MIN[0] >= 60 ? `${Math.round(LEARNING_STEPS_MIN[0] / 60)} h` : `${LEARNING_STEPS_MIN[0]} min`;
+    setFeedback({ success: true, isLesson: true, message: `Première révision programmée dans ${stepLabel}.` });
     setMode('feedback');
   };
 
@@ -253,27 +291,71 @@ export default function App() {
     setMode('qcm');
   };
 
-  const processResult = async (success, bonus) => {
+  // grade: 'again' | 'hard' | 'good' | 'easy'  (Anki-style self-assessment)
+  const processResult = async (grade) => {
     const now = Date.now();
-    let level = currentCard.level || 0;
-    let confidence = currentCard.confidence || 0;
-    let days = 1;
-    if (success) {
-      level = Math.max(1, level);
-      confidence = Math.min(100, confidence + bonus);
-      days = Math.max(1, (confidence / 20) * (level || 1));
+    const c = currentCard;
+    const inLearning = typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length;
+    let updated;
+
+    if (grade === 'again') {
+      if (inLearning) {
+        updated = { ...c, learningStep: 0, nextReview: now + LEARNING_STEPS_MIN[0] * 60000 };
+      } else {
+        const efactor = Math.max(MIN_EASE, (c.efactor || DEFAULT_EASE) - 0.2);
+        updated = {
+          ...c,
+          efactor,
+          learningStep: 0,
+          lapseInterval: Math.max(1, Math.round((c.interval || 1) * 0.5)),
+          nextReview: now + LEARNING_STEPS_MIN[0] * 60000,
+        };
+      }
+    } else if (inLearning) {
+      if (grade === 'easy') {
+        updated = { ...c, learningStep: null, interval: 4, efactor: Math.min(2.8, (c.efactor || DEFAULT_EASE) + 0.15), nextReview: now + 4 * 86400000, lapseInterval: null };
+      } else {
+        const nextStep = c.learningStep + 1;
+        if (nextStep < LEARNING_STEPS_MIN.length) {
+          updated = { ...c, learningStep: nextStep, nextReview: now + LEARNING_STEPS_MIN[nextStep] * 60000 };
+        } else {
+          const interval = c.lapseInterval || 1;
+          updated = { ...c, learningStep: null, interval, nextReview: now + interval * 86400000, efactor: c.efactor || DEFAULT_EASE, lapseInterval: null };
+        }
+      }
     } else {
-      confidence = Math.max(0, confidence - 20);
-      days = 0;
+      const efactor = c.efactor || DEFAULT_EASE;
+      const interval = c.interval || 1;
+      const delayDays = Math.max(0, (now - (c.nextReview || now)) / 86400000);
+
+      if (grade === 'hard') {
+        const newEfactor = Math.max(MIN_EASE, efactor - 0.15);
+        const newInterval = Math.max(interval + 1, Math.round((interval + delayDays / 4) * 1.2));
+        updated = { ...c, efactor: newEfactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
+      } else if (grade === 'easy') {
+        const newEfactor = Math.min(2.8, efactor + 0.15);
+        const newInterval = Math.max(1, Math.round((interval + delayDays) * newEfactor * 1.3));
+        updated = { ...c, efactor: newEfactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
+      } else {
+        const newInterval = Math.max(1, Math.round((interval + delayDays / 2) * efactor));
+        updated = { ...c, efactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
+      }
     }
-    await saveCard({ ...currentCard, level, confidence, nextReview: now + days * 86400000 });
+
+    updated.totalReviews = (c.totalReviews || 0) + 1;
+    updated.lastReviewAt = now;
+    await saveCard(updated);
     setMode('feedback');
   };
 
   const handleQcmSelect = (opt) => {
     const success = opt === currentCard.nom;
-    setFeedback({ success, message: success ? 'Correct.' : `Réponse attendue : ${currentCard.nom}` });
-    processResult(success, 10);
+    if (!success) {
+      setFeedback({ success: false, message: `Réponse attendue : ${currentCard.nom}` });
+      processResult('again');
+    } else {
+      setMode('grade');
+    }
   };
 
   const handleInputSubmit = () => {
@@ -283,8 +365,18 @@ export default function App() {
     if (!match && currentCard.alias) {
       match = currentCard.alias.split(';').some((a) => levenshtein(a, userInput) <= limit);
     }
-    setFeedback({ success: match, message: match ? 'Excellente maîtrise.' : `Notion attendue : ${target}` });
-    processResult(match, 20);
+    if (!match) {
+      setFeedback({ success: false, message: `Notion attendue : ${target}` });
+      processResult('again');
+    } else {
+      setMode('grade');
+    }
+  };
+
+  const handleGradeSelect = (grade) => {
+    const labels = { hard: 'Difficile — révisée bientôt.', good: 'Correct — intervalle allongé normalement.', easy: 'Facile — intervalle allongé fortement.' };
+    setFeedback({ success: true, message: labels[grade] });
+    processResult(grade);
   };
 
   if (authLoading) return <div style={{ ...s.page, textAlign: 'center', paddingTop: 100 }}>Chargement…</div>;
@@ -329,15 +421,28 @@ export default function App() {
         <>
           {cards.length > 0 && (() => {
             const total = cards.length;
-            const started = cards.filter((c) => (c.level || 0) > 0).length;
+            const started = cards.filter((c) => c.firstSeenAt).length;
             const pct = Math.round((started / total) * 100);
             const now = Date.now();
-            const due = cards.filter((c) => (c.level || 0) > 0 && (c.nextReview || 0) <= now).length;
+            const due = cards.filter((c) => c.firstSeenAt && (c.nextReview || 0) <= now).length;
             const newOnes = total - started;
-            const avgConf = started
-              ? Math.round(cards.filter((c) => (c.level || 0) > 0).reduce((sum, c) => sum + (c.confidence || 0), 0) / started)
-              : 0;
+            const mastered = cards.filter((c) => (c.interval || 0) >= MATURE_DAYS).length;
+            const totalReviewsAll = cards.reduce((sum, c) => sum + (c.totalReviews || 0), 0);
+            const reviewsToday = cards.filter((c) => isToday(c.lastReviewAt)).length;
             const newToday = cards.filter((c) => isToday(c.firstSeenAt)).length;
+
+            const activeDays = new Set(cards.filter((c) => c.lastReviewAt).map((c) => dateKey(c.lastReviewAt)));
+            let streak = 0;
+            let cursor = new Date();
+            if (!activeDays.has(dateKey(cursor.getTime()))) cursor.setDate(cursor.getDate() - 1);
+            while (activeDays.has(dateKey(cursor.getTime()))) {
+              streak++;
+              cursor.setDate(cursor.getDate() - 1);
+            }
+
+            const nextMilestone = Math.ceil((mastered + 1) / 10) * 10;
+            const toMilestone = nextMilestone - mastered;
+
             return (
               <div style={s.card}>
                 <h3 style={{ marginTop: 0 }}>Progression</h3>
@@ -345,6 +450,7 @@ export default function App() {
                   <div style={{ width: `${pct}%`, background: '#4f46e5', height: '100%' }} />
                 </div>
                 <p style={{ fontSize: 12, color: '#64748b', margin: '0 0 16px' }}>{started} / {total} fiches abordées ({pct}%)</p>
+
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, textAlign: 'center' }}>
                   <div style={{ background: due > 0 ? '#fff7ed' : '#f0fdf4', borderRadius: 10, padding: 12 }}>
                     <div style={{ fontSize: 22, fontWeight: 800, color: due > 0 ? '#c2410c' : '#16a34a' }}>{due}</div>
@@ -354,11 +460,33 @@ export default function App() {
                     <div style={{ fontSize: 22, fontWeight: 800, color: '#4338ca' }}>{newOnes}</div>
                     <div style={{ fontSize: 11, color: '#64748b' }}>nouvelles</div>
                   </div>
-                  <div style={{ background: '#f1f5f9', borderRadius: 10, padding: 12 }}>
-                    <div style={{ fontSize: 22, fontWeight: 800, color: '#334155' }}>{avgConf}%</div>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>confiance moy.</div>
+                  <div style={{ background: '#fef9c3', borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: '#a16207' }}>{streak} 🔥</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>jours de suite</div>
                   </div>
                 </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, textAlign: 'center', marginTop: 10 }}>
+                  <div style={{ background: '#f0fdfa', borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: '#0f766e' }}>{mastered}</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>maîtrisées (≥{MATURE_DAYS}j)</div>
+                  </div>
+                  <div style={{ background: '#f1f5f9', borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: '#334155' }}>{totalReviewsAll}</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>révisions au total</div>
+                  </div>
+                  <div style={{ background: '#f5f3ff', borderRadius: 10, padding: 12 }}>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: '#6d28d9' }}>{reviewsToday}</div>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>fiches vues aujourd'hui</div>
+                  </div>
+                </div>
+
+                {mastered > 0 && (
+                  <p style={{ fontSize: 13, color: '#0f766e', background: '#f0fdfa', borderRadius: 8, padding: '8px 12px', marginTop: 12 }}>
+                    Plus que {toMilestone} fiche{toMilestone > 1 ? 's' : ''} maîtrisée{toMilestone > 1 ? 's' : ''} pour atteindre {nextMilestone} !
+                  </p>
+                )}
+
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 16, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
                   <label style={{ fontSize: 13, color: '#475569', flex: 1 }}>
                     Nouvelles leçons max. par jour
@@ -382,6 +510,21 @@ export default function App() {
               <p style={{ color: '#475569', fontSize: 14 }}>
                 Revenez demain pour de nouvelles découvertes, ou augmentez la limite ci-dessus.
               </p>
+            </div>
+          )}
+
+          {cards.length > 0 && (
+            <div style={{ ...s.card, borderColor: '#fecaca' }}>
+              <h3 style={{ marginTop: 0, color: '#b91c1c' }}>Zone sensible</h3>
+              <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 12px' }}>
+                Supprime définitivement les {cards.length} fiches actuelles et leur progression, pour repartir d'une base propre.
+              </p>
+              <button
+                style={{ background: '#fee2e2', color: '#b91c1c', border: 'none', padding: '10px 16px', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer' }}
+                onClick={handleDeleteAll}
+              >
+                Supprimer toutes les fiches
+              </button>
             </div>
           )}
 
@@ -437,7 +580,9 @@ export default function App() {
 
       {currentCard && mode === null && (
         <div style={s.card}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', textTransform: 'uppercase' }}>Révision — confiance {currentCard.confidence || 0}%</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: typeof currentCard.learningStep === 'number' ? '#7c3aed' : '#2563eb', textTransform: 'uppercase' }}>
+            {typeof currentCard.learningStep === 'number' ? 'Apprentissage en cours' : `Révision — intervalle ${currentCard.interval || 1} j`}
+          </span>
           <h2 style={{ fontStyle: 'italic', fontWeight: 500 }}>« {currentCard.definition} »</h2>
           <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
             <button style={{ ...s.btnSecondary, flex: 1 }} onClick={generateQcm}>QCM</button>
@@ -464,6 +609,19 @@ export default function App() {
             <input style={s.input} autoFocus value={userInput} onChange={(e) => setUserInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleInputSubmit()} placeholder="Nom de la notion..." />
             <button style={s.btnPrimary} onClick={handleInputSubmit}>Valider</button>
+          </div>
+        </div>
+      )}
+
+      {currentCard && mode === 'grade' && (
+        <div style={s.card}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a', textTransform: 'uppercase' }}>Bonne réponse</span>
+          <h2 style={{ margin: '8px 0 16px' }}>{currentCard.nom}</h2>
+          <p style={{ fontSize: 14, color: '#64748b', marginBottom: 16 }}>À quel point ce rappel était-il facile ?</p>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+            <button style={{ background: '#fee2e2', color: '#b91c1c', border: 'none', padding: '14px 8px', borderRadius: 10, fontWeight: 600, cursor: 'pointer' }} onClick={() => handleGradeSelect('hard')}>Difficile</button>
+            <button style={{ background: '#dbeafe', color: '#1d4ed8', border: 'none', padding: '14px 8px', borderRadius: 10, fontWeight: 600, cursor: 'pointer' }} onClick={() => handleGradeSelect('good')}>Correct</button>
+            <button style={{ background: '#dcfce7', color: '#15803d', border: 'none', padding: '14px 8px', borderRadius: 10, fontWeight: 600, cursor: 'pointer' }} onClick={() => handleGradeSelect('easy')}>Facile</button>
           </div>
         </div>
       )}
