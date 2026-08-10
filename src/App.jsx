@@ -18,7 +18,6 @@ import {
   onSnapshot,
 } from 'firebase/firestore';
 
-// ---- Firebase config (from the user's tlkb-engine-prod project) ----
 const firebaseConfig = {
   apiKey: 'AIzaSyD4G2DU-XJhSU1LQ7JWawSLulagPeFi-cc',
   authDomain: 'tlkb-engine-prod.firebaseapp.com',
@@ -32,7 +31,6 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
-// ---- Utilities ----
 function levenshtein(a, b) {
   const na = a.toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   const nb = b.toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -80,11 +78,24 @@ function parseCsv(text) {
   }).filter(Boolean);
 }
 
-// ---- Spaced repetition engine (Anki-style SM-2 with same-day learning steps) ----
-const LEARNING_STEPS_MIN = [10, 1440]; // 10 minutes, then 1 day, before graduating
-const DEFAULT_EASE = 2.5;
-const MIN_EASE = 1.3;
-const MATURE_DAYS = 21; // Anki's definition of a "mature" card
+// ---- Spaced repetition engine (stability-based, R(t)=e^(-t/S), inspired by FSRS principles) ----
+const LEARNING_STEPS_MIN = [10, 1440]; // 10 minutes, then 1 day, before the first real review
+const TARGET_RETENTION = 0.9; // aim to review a fiche just before recall probability drops below this
+const K = -Math.log(TARGET_RETENTION); // R(t)=target  =>  t = S * K
+const INITIAL_STABILITY = 2 / K; // gives a ~2-day first interval after graduation
+const MIN_STABILITY = 1 / K; // floor, ~1-day minimum interval
+const MATURE_DAYS = 21; // a fiche is considered "mature" once its interval reaches this
+
+function scheduleFromStability(stability) {
+  return Math.max(1, Math.round(stability * K));
+}
+
+function computeGrowthFactor(grade, difficultyMemory) {
+  if (grade === 'hard') return 1.2;
+  if (grade === 'good') return 1.5 + (10 - difficultyMemory) / 10;
+  if (grade === 'easy') return 2.0 + ((10 - difficultyMemory) / 10) * 1.5;
+  return 1;
+}
 
 function dateKey(ts) {
   const d = new Date(ts);
@@ -114,7 +125,7 @@ export default function App() {
   const [importMsg, setImportMsg] = useState('');
 
   const [currentCard, setCurrentCard] = useState(null);
-  const [mode, setMode] = useState(null); // 'lesson' | null | 'qcm' | 'input' | 'grade' | 'feedback'
+  const [mode, setMode] = useState(null);
   const [qcmOptions, setQcmOptions] = useState([]);
   const [userInput, setUserInput] = useState('');
   const [feedback, setFeedback] = useState(null);
@@ -124,6 +135,11 @@ export default function App() {
     return saved ? parseInt(saved, 10) : 10;
   });
   const [noMoreToday, setNoMoreToday] = useState(false);
+  const [dailyLesson, setDailyLesson] = useState(null);
+  const [lessonIndex, setLessonIndex] = useState(0);
+  const [lessonScratch, setLessonScratch] = useState('');
+  const [revealed, setRevealed] = useState(false);
+  const [cardShownAt, setCardShownAt] = useState(null);
 
   const updateDailyLimit = (val) => {
     const n = Math.max(1, parseInt(val, 10) || 10);
@@ -214,6 +230,92 @@ export default function App() {
     e.target.value = '';
   };
 
+  const CULTURE_TYPES = ['personnalite', 'oeuvre', 'evenement', 'citation', 'figure_rhetorique', 'experience_pensee'];
+
+  const startDailyLesson = () => {
+    const now = Date.now();
+    const due = cards.filter((c) => c.firstSeenAt && (c.nextReview || 0) <= now)
+      .sort((a, b) => {
+        const fa = (a.stability || INITIAL_STABILITY) - (a.failureCount || 0) * 2;
+        const fb = (b.stability || INITIAL_STABILITY) - (b.failureCount || 0) * 2;
+        return fa - fb;
+      })
+      .slice(0, 5);
+
+    const pickByType = (type, exclude) => {
+      const pool = cards.filter((c) => c.type === type && !exclude.includes(c.id));
+      const dueOne = pool.find((c) => c.firstSeenAt && (c.nextReview || 0) <= now);
+      if (dueOne) return dueOne;
+      const newOne = pool.filter((c) => !c.firstSeenAt).sort((a, b) => (parseInt(b.utilite) || 3) - (parseInt(a.utilite) || 3))[0];
+      return newOne || pool[0] || null;
+    };
+
+    const used = due.map((c) => c.id);
+    const mot = pickByType('mot', used);
+    if (mot) used.push(mot.id);
+    const concept = pickByType('concept', used);
+    if (concept) used.push(concept.id);
+    let culture = null;
+    for (const t of CULTURE_TYPES) {
+      culture = pickByType(t, used);
+      if (culture) break;
+    }
+    if (culture) used.push(culture.id);
+
+    const steps = [];
+    due.forEach((c) => steps.push({ type: 'revision', card: c }));
+    if (mot) steps.push({ type: 'mot', card: mot });
+    if (concept) steps.push({ type: 'concept', card: concept });
+    if (culture) steps.push({ type: 'culture', card: culture });
+    if (mot) steps.push({ type: 'lexical', card: mot });
+    const recallCards = [mot, concept, culture].filter(Boolean);
+    if (recallCards.length) steps.push({ type: 'recall', cards: recallCards });
+    const appCard = concept || mot || culture;
+    if (appCard) steps.push({ type: 'application', card: appCard });
+
+    if (steps.length === 0) { setImportMsg("Pas assez de fiches variées (mot/concept/référence) pour composer une leçon."); return; }
+    setDailyLesson(steps);
+    setLessonIndex(0);
+    setLessonScratch('');
+    setRevealed(false);
+  };
+
+  const acknowledgeAndInit = async (card) => {
+    const now = Date.now();
+    if (!card.firstSeenAt) {
+      await saveCard({
+        ...card,
+        firstSeenAt: now,
+        learningStep: 0,
+        nextReview: now + LEARNING_STEPS_MIN[0] * 60000,
+        difficultyMemory: card.difficultyMemory || 5,
+        totalReviews: card.totalReviews || 0,
+      });
+    } else if ((card.nextReview || 0) <= now) {
+      const difficultyMemory = card.difficultyMemory || 5;
+      const factor = computeGrowthFactor('good', difficultyMemory);
+      const stability = (card.stability || INITIAL_STABILITY) * factor;
+      const interval = scheduleFromStability(stability);
+      await saveCard({
+        ...card,
+        stability,
+        interval,
+        nextReview: now + interval * 86400000,
+        successCount: (card.successCount || 0) + 1,
+        totalReviews: (card.totalReviews || 0) + 1,
+        lastReviewAt: now,
+        lastReview: now,
+      });
+    }
+  };
+
+  const advanceLesson = () => {
+    setLessonScratch('');
+    setRevealed(false);
+    if (lessonIndex + 1 < dailyLesson.length) setLessonIndex(lessonIndex + 1);
+    else { setDailyLesson(null); setLessonIndex(0); }
+  };
+
   const getNextCard = useCallback(() => {
     const now = Date.now();
     const newToday = cards.filter((c) => isToday(c.firstSeenAt)).length;
@@ -235,7 +337,11 @@ export default function App() {
       return pb - pa;
     });
 
-    reviewDue.sort((a, b) => (a.efactor || DEFAULT_EASE) - (b.efactor || DEFAULT_EASE));
+    reviewDue.sort((a, b) => {
+      const fa = (a.stability || INITIAL_STABILITY) - (b.failureCount || 0) * 2;
+      const fb = (b.stability || INITIAL_STABILITY) - (a.failureCount || 0) * 2;
+      return fa - fb;
+    });
 
     let next = null;
     if (learningDue.length) {
@@ -255,6 +361,7 @@ export default function App() {
     }
     setNoMoreToday(false);
     setCurrentCard(next);
+    setCardShownAt(Date.now());
     setMode(!next.firstSeenAt ? 'lesson' : null);
     setFeedback(null);
     setUserInput('');
@@ -272,8 +379,7 @@ export default function App() {
       firstSeenAt: Date.now(),
       learningStep: 0,
       nextReview: Date.now() + LEARNING_STEPS_MIN[0] * 60000,
-      efactor: currentCard.efactor || DEFAULT_EASE,
-      interval: 0,
+      difficultyMemory: currentCard.difficultyMemory || 5,
       totalReviews: currentCard.totalReviews || 0,
     };
     await saveCard(updated);
@@ -291,59 +397,73 @@ export default function App() {
     setMode('qcm');
   };
 
-  // grade: 'again' | 'hard' | 'good' | 'easy'  (Anki-style self-assessment)
   const processResult = async (grade) => {
     const now = Date.now();
     const c = currentCard;
+    const responseTimeMs = cardShownAt ? now - cardShownAt : c.responseTimeMs || null;
     const inLearning = typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length;
+    const difficultyMemory = c.difficultyMemory || 5;
     let updated;
 
     if (grade === 'again') {
+      const failureCount = (c.failureCount || 0) + 1;
       if (inLearning) {
-        updated = { ...c, learningStep: 0, nextReview: now + LEARNING_STEPS_MIN[0] * 60000 };
+        updated = { ...c, learningStep: 0, nextReview: now + LEARNING_STEPS_MIN[0] * 60000, failureCount };
       } else {
-        const efactor = Math.max(MIN_EASE, (c.efactor || DEFAULT_EASE) - 0.2);
+        const stability = Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 0.5);
         updated = {
           ...c,
-          efactor,
+          stability,
+          difficultyMemory: Math.min(10, difficultyMemory + 1),
+          failureCount,
+          lapseCount: (c.lapseCount || 0) + 1,
           learningStep: 0,
-          lapseInterval: Math.max(1, Math.round((c.interval || 1) * 0.5)),
+          relearning: true,
           nextReview: now + LEARNING_STEPS_MIN[0] * 60000,
         };
       }
     } else if (inLearning) {
-      if (grade === 'easy') {
-        updated = { ...c, learningStep: null, interval: 4, efactor: Math.min(2.8, (c.efactor || DEFAULT_EASE) + 0.15), nextReview: now + 4 * 86400000, lapseInterval: null };
+      const nextStep = c.learningStep + 1;
+      if (nextStep < LEARNING_STEPS_MIN.length) {
+        updated = { ...c, learningStep: nextStep, nextReview: now + LEARNING_STEPS_MIN[nextStep] * 60000 };
       } else {
-        const nextStep = c.learningStep + 1;
-        if (nextStep < LEARNING_STEPS_MIN.length) {
-          updated = { ...c, learningStep: nextStep, nextReview: now + LEARNING_STEPS_MIN[nextStep] * 60000 };
+        let stability;
+        if (c.relearning) {
+          stability = Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 1.2);
         } else {
-          const interval = c.lapseInterval || 1;
-          updated = { ...c, learningStep: null, interval, nextReview: now + interval * 86400000, efactor: c.efactor || DEFAULT_EASE, lapseInterval: null };
+          stability = INITIAL_STABILITY * (grade === 'easy' ? 1.3 : 1);
         }
+        const interval = scheduleFromStability(stability);
+        updated = {
+          ...c,
+          learningStep: null,
+          relearning: false,
+          stability,
+          interval,
+          nextReview: now + interval * 86400000,
+          successCount: (c.successCount || 0) + 1,
+        };
       }
     } else {
-      const efactor = c.efactor || DEFAULT_EASE;
-      const interval = c.interval || 1;
-      const delayDays = Math.max(0, (now - (c.nextReview || now)) / 86400000);
-
-      if (grade === 'hard') {
-        const newEfactor = Math.max(MIN_EASE, efactor - 0.15);
-        const newInterval = Math.max(interval + 1, Math.round((interval + delayDays / 4) * 1.2));
-        updated = { ...c, efactor: newEfactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
-      } else if (grade === 'easy') {
-        const newEfactor = Math.min(2.8, efactor + 0.15);
-        const newInterval = Math.max(1, Math.round((interval + delayDays) * newEfactor * 1.3));
-        updated = { ...c, efactor: newEfactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
-      } else {
-        const newInterval = Math.max(1, Math.round((interval + delayDays / 2) * efactor));
-        updated = { ...c, efactor, interval: newInterval, nextReview: now + newInterval * 86400000 };
-      }
+      const factor = computeGrowthFactor(grade, difficultyMemory);
+      const stability = (c.stability || INITIAL_STABILITY) * factor;
+      const interval = scheduleFromStability(stability);
+      const diffDelta = { hard: 0.5, good: -0.2, easy: -0.5 }[grade] || 0;
+      updated = {
+        ...c,
+        stability,
+        interval,
+        nextReview: now + interval * 86400000,
+        difficultyMemory: Math.max(1, Math.min(10, difficultyMemory + diffDelta)),
+        successCount: (c.successCount || 0) + 1,
+      };
     }
 
     updated.totalReviews = (c.totalReviews || 0) + 1;
     updated.lastReviewAt = now;
+    updated.lastReview = now;
+    updated.responseTimeMs = responseTimeMs;
+    updated.attempt = c.relearning ? 2 : 1;
     await saveCard(updated);
     setMode('feedback');
   };
@@ -417,7 +537,7 @@ export default function App() {
         <button style={s.btnGhost} onClick={() => signOut(auth)}>Déconnexion</button>
       </div>
 
-      {!currentCard && (
+      {!currentCard && !dailyLesson && (
         <>
           {cards.length > 0 && (() => {
             const total = cards.length;
@@ -549,11 +669,153 @@ export default function App() {
           {cards.length > 0 && (
             <div style={{ ...s.card, textAlign: 'center' }}>
               <h3 style={{ marginTop: 0 }}>Prêt pour l'apprentissage</h3>
-              <button style={s.btnPrimary} onClick={getNextCard}>Démarrer la session</button>
+              <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+                <button style={s.btnPrimary} onClick={getNextCard}>Session de révision</button>
+                <button style={s.btnSecondary} onClick={startDailyLesson}>Leçon du jour composée (7 étapes)</button>
+              </div>
             </div>
           )}
         </>
       )}
+
+      {dailyLesson && (() => {
+        const step = dailyLesson[lessonIndex];
+        const progress = `Étape ${lessonIndex + 1} / ${dailyLesson.length}`;
+
+        const finishStep = async (card) => {
+          if (card) await acknowledgeAndInit(card);
+          advanceLesson();
+        };
+
+        if (step.type === 'revision') {
+          const c = step.card;
+          return (
+            <div style={s.card}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', textTransform: 'uppercase' }}>{progress} · Révision</span>
+              <h2 style={{ margin: '8px 0 4px' }}>{c.nom}</h2>
+              {!revealed ? (
+                <>
+                  <p style={{ color: '#64748b', fontSize: 14 }}>Essayez de vous rappeler la définition avant de révéler.</p>
+                  <button style={{ ...s.btnPrimary, marginTop: 8 }} onClick={() => setRevealed(true)}>Révéler</button>
+                </>
+              ) : (
+                <>
+                  <div style={{ background: '#f8fafc', borderRadius: 10, padding: 16, margin: '12px 0' }}>
+                    <p style={{ margin: 0 }}>{c.definition}</p>
+                  </div>
+                  <button style={{ ...s.btnPrimary, width: '100%' }} onClick={() => finishStep(c)}>Suivant →</button>
+                </>
+              )}
+            </div>
+          );
+        }
+
+        if (step.type === 'mot' || step.type === 'concept' || step.type === 'culture') {
+          const c = step.card;
+          const labels = { mot: 'Mot précis', concept: 'Concept', culture: 'Référence culturelle' };
+          return (
+            <div style={s.card}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#7c3aed', textTransform: 'uppercase' }}>{progress} · {labels[step.type]}</span>
+              <h2 style={{ margin: '8px 0 4px' }}>{c.nom}</h2>
+              {c.origine && <p style={{ color: '#64748b', fontSize: 13, marginTop: 0 }}>{c.origine}</p>}
+              {c.auteur && <p style={{ color: '#64748b', fontSize: 13, marginTop: 0 }}>{c.auteur}</p>}
+              <div style={{ background: '#f8fafc', borderRadius: 10, padding: 16, margin: '12px 0' }}>
+                <strong style={{ fontSize: 11, color: '#94a3b8' }}>DÉFINITION</strong>
+                <p style={{ fontSize: 17, margin: '6px 0 0' }}>{c.definition}</p>
+              </div>
+              <div style={{ background: '#eef2ff', borderRadius: 10, padding: 16, margin: '12px 0' }}>
+                <strong style={{ fontSize: 11, color: '#6366f1' }}>EXEMPLE</strong>
+                <p style={{ margin: '6px 0 0' }}>{c.exemple}</p>
+              </div>
+              {c.contraire && (
+                <div style={{ background: '#fef2f2', borderRadius: 10, padding: 16, margin: '12px 0' }}>
+                  <strong style={{ fontSize: 11, color: '#b91c1c' }}>CONTRAIRE</strong>
+                  <p style={{ margin: '6px 0 0' }}>{c.contraire}</p>
+                </div>
+              )}
+              {c.pieges && (
+                <div style={{ background: '#fff7ed', borderLeft: '4px solid #fb923c', padding: 14, borderRadius: 8, margin: '12px 0' }}>
+                  <strong style={{ fontSize: 11, color: '#c2410c' }}>PIÈGE</strong>
+                  <p style={{ margin: '6px 0 0' }}>{c.pieges}</p>
+                </div>
+              )}
+              <button style={{ ...s.btnPrimary, width: '100%', marginTop: 8 }} onClick={() => finishStep(c)}>Suivant →</button>
+            </div>
+          );
+        }
+
+        if (step.type === 'lexical') {
+          const c = step.card;
+          return (
+            <div style={s.card}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#0f766e', textTransform: 'uppercase' }}>{progress} · Exercice lexical</span>
+              <h2 style={{ margin: '8px 0 16px' }}>{c.nom}</h2>
+              <p style={{ fontSize: 15, marginBottom: 12 }}>
+                Proposez un synonyme{c.alias ? ' (différent de celui déjà connu)' : ''}
+                {c.contraire ? `, puis expliquez en une phrase la différence avec son contraire « ${c.contraire} ».` : '.'}
+              </p>
+              <textarea
+                style={{ ...s.input, height: 80 }}
+                placeholder="Votre réponse (non corrigée, pour vous entraîner)..."
+                value={lessonScratch}
+                onChange={(e) => setLessonScratch(e.target.value)}
+              />
+              {c.alias && revealed && (
+                <p style={{ fontSize: 13, color: '#64748b', marginTop: 8 }}>Synonyme(s) connu(s) : {c.alias}</p>
+              )}
+              <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+                {c.alias && !revealed && <button style={s.btnGhost} onClick={() => setRevealed(true)}>Voir un synonyme connu</button>}
+                <button style={{ ...s.btnPrimary, flex: 1 }} onClick={() => finishStep(null)}>Suivant →</button>
+              </div>
+            </div>
+          );
+        }
+
+        if (step.type === 'recall') {
+          const qs = [];
+          const [c1, c2, c3] = step.cards;
+          if (c1) qs.push({ q: `Définissez : ${c1.nom}`, a: c1.definition });
+          if (c1 && c2) qs.push({ q: `Quelle différence entre ${c1.nom} et ${c2.nom} ?`, a: `${c1.nom} : ${c1.definition}\n${c2.nom} : ${c2.definition}` });
+          const last = c3 || c2 || c1;
+          if (last) qs.push({ q: `Comment appliquer « ${last.nom} » à ${last.applications ? last.applications.split(';')[0] : 'une situation professionnelle'} ?`, a: last.exemple });
+          return (
+            <div style={s.card}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', textTransform: 'uppercase' }}>{progress} · Rappel actif</span>
+              {qs.map((item, i) => (
+                <div key={i} style={{ marginTop: i === 0 ? 8 : 20, paddingTop: i === 0 ? 0 : 16, borderTop: i === 0 ? 'none' : '1px solid #e2e8f0' }}>
+                  <p style={{ fontWeight: 600, marginBottom: 8 }}>{i + 1}. {item.q}</p>
+                  <p style={{ fontSize: 13, color: '#94a3b8' }}>Répondez mentalement ou à voix haute, puis comparez :</p>
+                  <p style={{ fontSize: 13, background: '#f8fafc', borderRadius: 8, padding: 10, whiteSpace: 'pre-line' }}>{item.a}</p>
+                </div>
+              ))}
+              <button style={{ ...s.btnPrimary, width: '100%', marginTop: 16 }} onClick={() => finishStep(null)}>Suivant →</button>
+            </div>
+          );
+        }
+
+        if (step.type === 'application') {
+          const c = step.card;
+          return (
+            <div style={s.card}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#a16207', textTransform: 'uppercase' }}>{progress} · Application concrète</span>
+              <h2 style={{ margin: '8px 0 16px' }}>{c.nom}</h2>
+              {c.applications && (
+                <p style={{ fontSize: 14, color: '#64748b', marginBottom: 12 }}>Contextes suggérés : {c.applications.replace(/;/g, ', ')}</p>
+              )}
+              <p style={{ fontSize: 15, marginBottom: 12 }}>Notez une situation réelle où vous pourriez utiliser cette notion cette semaine.</p>
+              <textarea
+                style={{ ...s.input, height: 80 }}
+                placeholder="Votre application concrète..."
+                value={lessonScratch}
+                onChange={(e) => setLessonScratch(e.target.value)}
+              />
+              <button style={{ ...s.btnPrimary, width: '100%', marginTop: 12 }} onClick={() => finishStep(null)}>Terminer la leçon ✓</button>
+            </div>
+          );
+        }
+
+        return null;
+      })()}
 
       {currentCard && mode === 'lesson' && (
         <div style={s.card}>
