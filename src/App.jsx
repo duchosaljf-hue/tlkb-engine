@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import {
   getAuth,
@@ -16,6 +16,7 @@ import {
   setDoc,
   deleteDoc,
   onSnapshot,
+  increment,
 } from 'firebase/firestore';
 
 const firebaseConfig = {
@@ -78,16 +79,24 @@ function parseCsv(text) {
   }).filter(Boolean);
 }
 
-// ---- Spaced repetition engine (stability-based, R(t)=e^(-t/S), inspired by FSRS principles) ----
-const LEARNING_STEPS_MIN = [10, 1440]; // 10 minutes, then 1 day, before the first real review
-const TARGET_RETENTION = 0.9; // aim to review a fiche just before recall probability drops below this
-const K = -Math.log(TARGET_RETENTION); // R(t)=target  =>  t = S * K
-const INITIAL_STABILITY = 2 / K; // gives a ~2-day first interval after graduation
-const MIN_STABILITY = 1 / K; // floor, ~1-day minimum interval
-const MATURE_DAYS = 21; // a fiche is considered "mature" once its interval reaches this
+const LEARNING_STEPS_MIN = [10];
+const TARGET_RETENTION = 0.9;
+const K = -Math.log(TARGET_RETENTION);
+const INITIAL_STABILITY = 2 / K;
+const MIN_STABILITY = 1 / K;
+const MATURE_DAYS = 21;
+const MAX_INTERVAL_DAYS = 1095;
+const MAX_STABILITY = MAX_INTERVAL_DAYS / K;
 
 function scheduleFromStability(stability) {
-  return Math.max(1, Math.round(stability * K));
+  return Math.max(1, Math.min(MAX_INTERVAL_DAYS, Math.round(stability * K)));
+}
+
+function computeRetrievability(card, now) {
+  const stability = card.stability || INITIAL_STABILITY;
+  const lastReview = card.lastReview || card.firstSeenAt || now;
+  const daysSince = Math.max(0, (now - lastReview) / 86400000);
+  return Math.exp(-daysSince / stability);
 }
 
 function computeGrowthFactor(grade, difficultyMemory) {
@@ -97,10 +106,56 @@ function computeGrowthFactor(grade, difficultyMemory) {
   return 1;
 }
 
+function calculateReviewResult(card, grade, now, responseTimeMs = null) {
+  const c = card;
+  const inLearning = typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length;
+  const difficultyMemory = c.difficultyMemory || 5;
+  let updated;
+
+  if (grade === 'again') {
+    const failureCount = (c.failureCount || 0) + 1;
+    if (inLearning) {
+      updated = { ...c, learningStep: 0, nextReview: now + LEARNING_STEPS_MIN[0] * 60000, failureCount, postFailureAttempt: true };
+    } else {
+      const stability = Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 0.5);
+      updated = { ...c, stability, difficultyMemory: Math.min(10, difficultyMemory + 1), failureCount, lapseCount: (c.lapseCount || 0) + 1, learningStep: 0, relearning: true, postFailureAttempt: true, nextReview: now + LEARNING_STEPS_MIN[0] * 60000 };
+    }
+  } else if (inLearning) {
+    const nextStep = c.learningStep + 1;
+    if (nextStep < LEARNING_STEPS_MIN.length) {
+      updated = { ...c, learningStep: nextStep, nextReview: now + LEARNING_STEPS_MIN[nextStep] * 60000, postFailureAttempt: false };
+    } else {
+      let stability;
+      if (c.relearning) stability = Math.min(MAX_STABILITY, Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 1.2));
+      else stability = INITIAL_STABILITY * (grade === 'easy' ? 1.3 : 1);
+      const interval = scheduleFromStability(stability);
+      updated = { ...c, learningStep: null, relearning: false, postFailureAttempt: false, stability, interval, nextReview: now + interval * 86400000, successCount: (c.successCount || 0) + 1 };
+    }
+  } else {
+    const factor = computeGrowthFactor(grade, difficultyMemory);
+    const stability = Math.min(MAX_STABILITY, (c.stability || INITIAL_STABILITY) * factor);
+    const interval = scheduleFromStability(stability);
+    const diffDelta = { hard: 0.5, good: -0.2, easy: -0.5 }[grade] || 0;
+    updated = { ...c, stability, interval, nextReview: now + interval * 86400000, difficultyMemory: Math.max(1, Math.min(10, difficultyMemory + diffDelta)), successCount: (c.successCount || 0) + 1, postFailureAttempt: false };
+  }
+
+  updated.totalReviews = (c.totalReviews || 0) + 1;
+  updated.lastReviewAt = now;
+  updated.lastReview = now;
+  updated.responseTimeMs = responseTimeMs;
+  updated.attempt = c.postFailureAttempt ? 2 : 1;
+  return updated;
+}
+
+function applyPostFailureCap(card, grade) {
+  return card.postFailureAttempt && (grade === 'good' || grade === 'easy') ? 'hard' : grade;
+}
+
 function dateKey(ts) {
   const d = new Date(ts);
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
+
 const s = {
   page: { minHeight: '100vh', background: '#f8fafc', color: '#0f172a', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', padding: '20px', paddingBottom: '80px', boxSizing: 'border-box' },
   card: { background: '#fff', borderRadius: 16, border: '1px solid #e2e8f0', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', padding: 24, maxWidth: 720, margin: '0 auto 20px auto' },
@@ -135,11 +190,14 @@ export default function App() {
     return saved ? parseInt(saved, 10) : 10;
   });
   const [noMoreToday, setNoMoreToday] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [dailyLesson, setDailyLesson] = useState(null);
   const [lessonIndex, setLessonIndex] = useState(0);
   const [lessonScratch, setLessonScratch] = useState('');
   const [revealed, setRevealed] = useState(false);
   const [cardShownAt, setCardShownAt] = useState(null);
+  const [studyDaily, setStudyDaily] = useState({});
+  const sessionStartRef = useRef(null);
 
   const updateDailyLimit = (val) => {
     const n = Math.max(1, parseInt(val, 10) || 10);
@@ -167,6 +225,28 @@ export default function App() {
     });
     return unsub;
   }, [user]);
+
+  useEffect(() => {
+    if (!user) { setStudyDaily({}); return; }
+    const ref = doc(db, 'users', user.uid, 'meta', 'study');
+    const unsub = onSnapshot(ref, (snap) => {
+      setStudyDaily(snap.exists() ? (snap.data().daily || {}) : {});
+    });
+    return unsub;
+  }, [user]);
+
+  const recordStudyTime = async () => {
+    if (!sessionStartRef.current || !user) return;
+    const elapsed = Date.now() - sessionStartRef.current;
+    sessionStartRef.current = null;
+    if (elapsed < 2000 || elapsed > 3 * 3600000) return;
+    const ref = doc(db, 'users', user.uid, 'meta', 'study');
+    try {
+      await setDoc(ref, { daily: { [dateKey(Date.now())]: increment(elapsed) } }, { merge: true });
+    } catch (e) {
+      console.error('Erreur enregistrement temps d\'étude', e);
+    }
+  };
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -234,20 +314,17 @@ export default function App() {
 
   const startDailyLesson = () => {
     const now = Date.now();
-    const due = cards.filter((c) => c.firstSeenAt && (c.nextReview || 0) <= now)
-      .sort((a, b) => {
-        const fa = (a.stability || INITIAL_STABILITY) - (a.failureCount || 0) * 2;
-        const fb = (b.stability || INITIAL_STABILITY) - (b.failureCount || 0) * 2;
-        return fa - fb;
-      })
-      .slice(0, 5);
+    const learningDueForLesson = cards.filter((c) => c.firstSeenAt && typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length && (c.nextReview || 0) <= now)
+      .sort((a, b) => (a.nextReview || 0) - (b.nextReview || 0));
+    const gradedDueForLesson = cards.filter((c) => c.firstSeenAt && (c.learningStep === undefined || c.learningStep === null) && (c.nextReview || 0) <= now)
+      .sort((a, b) => computeRetrievability(a, now) - computeRetrievability(b, now));
+    const due = [...learningDueForLesson, ...gradedDueForLesson].slice(0, 5);
 
     const pickByType = (type, exclude) => {
       const pool = cards.filter((c) => c.type === type && !exclude.includes(c.id));
-      const dueOne = pool.find((c) => c.firstSeenAt && (c.nextReview || 0) <= now);
-      if (dueOne) return dueOne;
+      const dueOne = pool.find((c) => c.firstSeenAt && (c.learningStep === undefined || c.learningStep === null) && (c.nextReview || 0) <= now);
       const newOne = pool.filter((c) => !c.firstSeenAt).sort((a, b) => (parseInt(b.utilite) || 3) - (parseInt(a.utilite) || 3))[0];
-      return newOne || pool[0] || null;
+      return dueOne || newOne || null;
     };
 
     const used = due.map((c) => c.id);
@@ -281,8 +358,8 @@ export default function App() {
   };
 
   const acknowledgeAndInit = async (card) => {
-    const now = Date.now();
     if (!card.firstSeenAt) {
+      const now = Date.now();
       await saveCard({
         ...card,
         firstSeenAt: now,
@@ -291,29 +368,22 @@ export default function App() {
         difficultyMemory: card.difficultyMemory || 5,
         totalReviews: card.totalReviews || 0,
       });
-    } else if ((card.nextReview || 0) <= now) {
-      const difficultyMemory = card.difficultyMemory || 5;
-      const factor = computeGrowthFactor('good', difficultyMemory);
-      const stability = (card.stability || INITIAL_STABILITY) * factor;
-      const interval = scheduleFromStability(stability);
-      await saveCard({
-        ...card,
-        stability,
-        interval,
-        nextReview: now + interval * 86400000,
-        successCount: (card.successCount || 0) + 1,
-        totalReviews: (card.totalReviews || 0) + 1,
-        lastReviewAt: now,
-        lastReview: now,
-      });
     }
+  };
+
+  const gradeLessonRevision = async (card, grade) => {
+    const now = Date.now();
+    const effectiveGrade = applyPostFailureCap(card, grade);
+    const updated = calculateReviewResult(card, effectiveGrade, now, null);
+    await saveCard(updated);
+    advanceLesson();
   };
 
   const advanceLesson = () => {
     setLessonScratch('');
     setRevealed(false);
     if (lessonIndex + 1 < dailyLesson.length) setLessonIndex(lessonIndex + 1);
-    else { setDailyLesson(null); setLessonIndex(0); }
+    else { recordStudyTime(); setDailyLesson(null); setLessonIndex(0); }
   };
 
   const getNextCard = useCallback(() => {
@@ -322,7 +392,8 @@ export default function App() {
     const capReached = newToday >= dailyNewLimit;
 
     const brandNew = cards.filter((c) => !c.firstSeenAt);
-    const learningDue = cards.filter((c) => c.firstSeenAt && typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length && (c.nextReview || 0) <= now);
+    const learningDue = cards.filter((c) => c.firstSeenAt && typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length && (c.nextReview || 0) <= now)
+      .sort((a, b) => (a.nextReview || 0) - (b.nextReview || 0));
     const reviewDue = cards.filter((c) => c.firstSeenAt && (c.learningStep === undefined || c.learningStep === null) && (c.nextReview || 0) <= now);
 
     const eligibleNew = capReached ? [] : brandNew.filter((c) => {
@@ -338,9 +409,10 @@ export default function App() {
     });
 
     reviewDue.sort((a, b) => {
-      const fa = (a.stability || INITIAL_STABILITY) - (b.failureCount || 0) * 2;
-      const fb = (b.stability || INITIAL_STABILITY) - (a.failureCount || 0) * 2;
-      return fa - fb;
+      const ra = computeRetrievability(a, now);
+      const rb = computeRetrievability(b, now);
+      if (Math.abs(ra - rb) > 0.01) return ra - rb;
+      return (b.failureCount || 0) - (a.failureCount || 0);
     });
 
     let next = null;
@@ -354,6 +426,7 @@ export default function App() {
     }
 
     if (!next) {
+      recordStudyTime();
       setCurrentCard(null);
       setMode(null);
       setNoMoreToday(capReached && brandNew.length > 0);
@@ -365,7 +438,7 @@ export default function App() {
     setMode(!next.firstSeenAt ? 'lesson' : null);
     setFeedback(null);
     setUserInput('');
-  }, [cards, cycle, dailyNewLimit]);
+  }, [cards, cycle, dailyNewLimit, user]);
 
   const saveCard = async (updated) => {
     const ref = collection(db, 'users', user.uid, 'cards');
@@ -399,71 +472,8 @@ export default function App() {
 
   const processResult = async (grade) => {
     const now = Date.now();
-    const c = currentCard;
-    const responseTimeMs = cardShownAt ? now - cardShownAt : c.responseTimeMs || null;
-    const inLearning = typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length;
-    const difficultyMemory = c.difficultyMemory || 5;
-    let updated;
-
-    if (grade === 'again') {
-      const failureCount = (c.failureCount || 0) + 1;
-      if (inLearning) {
-        updated = { ...c, learningStep: 0, nextReview: now + LEARNING_STEPS_MIN[0] * 60000, failureCount };
-      } else {
-        const stability = Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 0.5);
-        updated = {
-          ...c,
-          stability,
-          difficultyMemory: Math.min(10, difficultyMemory + 1),
-          failureCount,
-          lapseCount: (c.lapseCount || 0) + 1,
-          learningStep: 0,
-          relearning: true,
-          nextReview: now + LEARNING_STEPS_MIN[0] * 60000,
-        };
-      }
-    } else if (inLearning) {
-      const nextStep = c.learningStep + 1;
-      if (nextStep < LEARNING_STEPS_MIN.length) {
-        updated = { ...c, learningStep: nextStep, nextReview: now + LEARNING_STEPS_MIN[nextStep] * 60000 };
-      } else {
-        let stability;
-        if (c.relearning) {
-          stability = Math.max(MIN_STABILITY, (c.stability || INITIAL_STABILITY) * 1.2);
-        } else {
-          stability = INITIAL_STABILITY * (grade === 'easy' ? 1.3 : 1);
-        }
-        const interval = scheduleFromStability(stability);
-        updated = {
-          ...c,
-          learningStep: null,
-          relearning: false,
-          stability,
-          interval,
-          nextReview: now + interval * 86400000,
-          successCount: (c.successCount || 0) + 1,
-        };
-      }
-    } else {
-      const factor = computeGrowthFactor(grade, difficultyMemory);
-      const stability = (c.stability || INITIAL_STABILITY) * factor;
-      const interval = scheduleFromStability(stability);
-      const diffDelta = { hard: 0.5, good: -0.2, easy: -0.5 }[grade] || 0;
-      updated = {
-        ...c,
-        stability,
-        interval,
-        nextReview: now + interval * 86400000,
-        difficultyMemory: Math.max(1, Math.min(10, difficultyMemory + diffDelta)),
-        successCount: (c.successCount || 0) + 1,
-      };
-    }
-
-    updated.totalReviews = (c.totalReviews || 0) + 1;
-    updated.lastReviewAt = now;
-    updated.lastReview = now;
-    updated.responseTimeMs = responseTimeMs;
-    updated.attempt = c.relearning ? 2 : 1;
+    const responseTimeMs = cardShownAt ? now - cardShownAt : currentCard.responseTimeMs || null;
+    const updated = calculateReviewResult(currentCard, grade, now, responseTimeMs);
     await saveCard(updated);
     setMode('feedback');
   };
@@ -494,9 +504,16 @@ export default function App() {
   };
 
   const handleGradeSelect = (grade) => {
+    const effectiveGrade = applyPostFailureCap(currentCard, grade);
+    const capped = effectiveGrade !== grade;
     const labels = { hard: 'Difficile — révisée bientôt.', good: 'Correct — intervalle allongé normalement.', easy: 'Facile — intervalle allongé fortement.' };
-    setFeedback({ success: true, message: labels[grade] });
-    processResult(grade);
+    setFeedback({
+      success: true,
+      message: capped
+        ? `Réussi après un échec précédent — compté comme "Difficile" (rappel post-échec).`
+        : labels[effectiveGrade],
+    });
+    processResult(effectiveGrade);
   };
 
   if (authLoading) return <div style={{ ...s.page, textAlign: 'center', paddingTop: 100 }}>Chargement…</div>;
@@ -534,10 +551,76 @@ export default function App() {
           <h1 style={s.h1}>TLKB Engine</h1>
           <p style={{ fontSize: 12, color: '#64748b', margin: '4px 0 0' }}>{cards.length} fiche(s) en base</p>
         </div>
-        <button style={s.btnGhost} onClick={() => signOut(auth)}>Déconnexion</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button style={s.btnGhost} onClick={() => setShowHistory(!showHistory)}>{showHistory ? 'Retour' : 'Historique'}</button>
+          <button style={s.btnGhost} onClick={() => signOut(auth)}>Déconnexion</button>
+        </div>
       </div>
 
-      {!currentCard && !dailyLesson && (
+      {showHistory && (() => {
+        const TYPE_LABELS = {
+          mot: 'Mots', concept: 'Concepts', personnalite: 'Personnalités', oeuvre: 'Œuvres',
+          evenement: 'Événements', citation: 'Citations', figure_rhetorique: 'Figures de rhétorique',
+          experience_pensee: 'Expériences de pensée',
+        };
+        const types = Object.keys(TYPE_LABELS);
+        const now = Date.now();
+        const breakdown = types.map((t) => {
+          const ofType = cards.filter((c) => c.type === t);
+          const started = ofType.filter((c) => c.firstSeenAt).length;
+          const seenToday = ofType.filter((c) => isToday(c.lastReviewAt)).length;
+          return { type: t, label: TYPE_LABELS[t], total: ofType.length, started, seenToday };
+        }).filter((row) => row.total > 0);
+        const totalStarted = breakdown.reduce((s, r) => s + r.started, 0) || 1;
+
+        const recent = cards.filter((c) => c.lastReviewAt).sort((a, b) => b.lastReviewAt - a.lastReviewAt).slice(0, 30);
+        const fmtDate = (ts) => new Date(ts).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+        return (
+          <>
+            <div style={s.card}>
+              <h3 style={{ marginTop: 0 }}>Répartition par type</h3>
+              <p style={{ fontSize: 12, color: '#64748b', marginTop: -8, marginBottom: 16 }}>
+                Sur {totalStarted} fiche(s) abordée(s) — pour vérifier l'équilibre entre mots, concepts, références...
+              </p>
+              {breakdown.sort((a, b) => b.started - a.started).map((row) => (
+                <div key={row.type} style={{ marginBottom: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, marginBottom: 4 }}>
+                    <span style={{ fontWeight: 600 }}>{row.label}</span>
+                    <span style={{ color: '#64748b' }}>{row.started} abordée(s) / {row.total} en base · {row.seenToday} aujourd'hui</span>
+                  </div>
+                  <div style={{ background: '#e2e8f0', borderRadius: 999, height: 8, overflow: 'hidden' }}>
+                    <div style={{ width: `${Math.round((row.started / totalStarted) * 100)}%`, background: '#4f46e5', height: '100%' }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={s.card}>
+              <h3 style={{ marginTop: 0 }}>30 dernières fiches vues</h3>
+              {recent.length === 0 ? (
+                <p style={{ fontSize: 13, color: '#64748b' }}>Aucune fiche vue pour l'instant.</p>
+              ) : (
+                <div>
+                  {recent.map((c) => (
+                    <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', borderBottom: '1px solid #f1f5f9' }}>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 600 }}>{c.nom}</div>
+                        <div style={{ fontSize: 11, color: '#94a3b8' }}>{TYPE_LABELS[c.type] || c.type} · {c.domaine || '—'}</div>
+                      </div>
+                      <div style={{ fontSize: 11, color: '#64748b', textAlign: 'right' }}>
+                        {fmtDate(c.lastReviewAt)}<br />intervalle {c.interval || 1}j
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
+
+      {!currentCard && !dailyLesson && !showHistory && (
         <>
           {cards.length > 0 && (() => {
             const total = cards.length;
@@ -563,6 +646,23 @@ export default function App() {
             const nextMilestone = Math.ceil((mastered + 1) / 10) * 10;
             const toMilestone = nextMilestone - mastered;
 
+            const fmtDuration = (ms) => {
+              const totalMin = Math.round(ms / 60000);
+              if (totalMin < 60) return `${totalMin} min`;
+              const h = Math.floor(totalMin / 60);
+              const m = totalMin % 60;
+              return `${h} h ${m.toString().padStart(2, '0')}`;
+            };
+            const todayMs = studyDaily[dateKey(now)] || 0;
+            const last7Keys = Array.from({ length: 7 }, (_, i) => {
+              const d = new Date(now);
+              d.setDate(d.getDate() - i);
+              return dateKey(d.getTime());
+            });
+            const weekMs = last7Keys.reduce((sum, k) => sum + (studyDaily[k] || 0), 0);
+            const activeDaysThisWeek = last7Keys.filter((k) => (studyDaily[k] || 0) > 0).length;
+            const avgDailyMs = weekMs / 7;
+
             return (
               <div style={s.card}>
                 <h3 style={{ marginTop: 0 }}>Progression</h3>
@@ -570,6 +670,16 @@ export default function App() {
                   <div style={{ width: `${pct}%`, background: '#4f46e5', height: '100%' }} />
                 </div>
                 <p style={{ fontSize: 12, color: '#64748b', margin: '0 0 16px' }}>{started} / {total} fiches abordées ({pct}%)</p>
+
+                <div style={{ background: '#eef2ff', borderRadius: 12, padding: 14, marginBottom: 16 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: '#4338ca' }}>Aujourd'hui : {fmtDuration(todayMs)}</span>
+                    <span style={{ fontSize: 11, color: '#94a3b8' }}>objectif 10–15 min</span>
+                  </div>
+                  <p style={{ fontSize: 12, color: '#64748b', margin: 0 }}>
+                    Cette semaine : {fmtDuration(weekMs)} ({activeDaysThisWeek}/7 jours actifs) — moyenne {fmtDuration(avgDailyMs)}/jour
+                  </p>
+                </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, textAlign: 'center' }}>
                   <div style={{ background: due > 0 ? '#fff7ed' : '#f0fdf4', borderRadius: 10, padding: 12 }}>
@@ -670,8 +780,8 @@ export default function App() {
             <div style={{ ...s.card, textAlign: 'center' }}>
               <h3 style={{ marginTop: 0 }}>Prêt pour l'apprentissage</h3>
               <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-                <button style={s.btnPrimary} onClick={getNextCard}>Session de révision</button>
-                <button style={s.btnSecondary} onClick={startDailyLesson}>Leçon du jour composée (7 étapes)</button>
+                <button style={s.btnPrimary} onClick={() => { sessionStartRef.current = Date.now(); getNextCard(); }}>Session de révision</button>
+                <button style={s.btnSecondary} onClick={() => { sessionStartRef.current = Date.now(); startDailyLesson(); }}>Leçon du jour composée (7 étapes)</button>
               </div>
             </div>
           )}
@@ -689,9 +799,12 @@ export default function App() {
 
         if (step.type === 'revision') {
           const c = step.card;
+          const isInLearning = typeof c.learningStep === 'number' && c.learningStep < LEARNING_STEPS_MIN.length;
           return (
             <div style={s.card}>
-              <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', textTransform: 'uppercase' }}>{progress} · Révision</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#2563eb', textTransform: 'uppercase' }}>
+                {progress} · {isInLearning ? 'Rappel d\'apprentissage' : 'Révision'}
+              </span>
               <h2 style={{ margin: '8px 0 4px' }}>{c.nom}</h2>
               {!revealed ? (
                 <>
@@ -703,7 +816,18 @@ export default function App() {
                   <div style={{ background: '#f8fafc', borderRadius: 10, padding: 16, margin: '12px 0' }}>
                     <p style={{ margin: 0 }}>{c.definition}</p>
                   </div>
-                  <button style={{ ...s.btnPrimary, width: '100%' }} onClick={() => finishStep(c)}>Suivant →</button>
+                  {c.postFailureAttempt && (
+                    <p style={{ fontSize: 12, color: '#b91c1c', background: '#fef2f2', borderRadius: 8, padding: '6px 10px', marginBottom: 12 }}>
+                      Rappel post-échec — un succès sera plafonné à "Difficile".
+                    </p>
+                  )}
+                  <p style={{ fontSize: 13, color: '#64748b', marginBottom: 8 }}>Vous en souveniez-vous ?</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8 }}>
+                    <button style={{ background: '#fee2e2', color: '#b91c1c', border: 'none', padding: '12px 4px', borderRadius: 10, fontWeight: 600, fontSize: 13, cursor: 'pointer' }} onClick={() => gradeLessonRevision(c, 'again')}>Oublié</button>
+                    <button style={{ background: '#ffedd5', color: '#c2410c', border: 'none', padding: '12px 4px', borderRadius: 10, fontWeight: 600, fontSize: 13, cursor: 'pointer' }} onClick={() => gradeLessonRevision(c, 'hard')}>Difficile</button>
+                    <button style={{ background: '#dbeafe', color: '#1d4ed8', border: 'none', padding: '12px 4px', borderRadius: 10, fontWeight: 600, fontSize: 13, cursor: 'pointer' }} onClick={() => gradeLessonRevision(c, 'good')}>Correct</button>
+                    <button style={{ background: '#dcfce7', color: '#15803d', border: 'none', padding: '12px 4px', borderRadius: 10, fontWeight: 600, fontSize: 13, cursor: 'pointer' }} onClick={() => gradeLessonRevision(c, 'easy')}>Facile</button>
+                  </div>
                 </>
               )}
             </div>
@@ -879,6 +1003,11 @@ export default function App() {
         <div style={s.card}>
           <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a', textTransform: 'uppercase' }}>Bonne réponse</span>
           <h2 style={{ margin: '8px 0 16px' }}>{currentCard.nom}</h2>
+          {currentCard.postFailureAttempt && (
+            <p style={{ fontSize: 12, color: '#b91c1c', background: '#fef2f2', borderRadius: 8, padding: '6px 10px', marginBottom: 12 }}>
+              Rappel post-échec — le résultat sera plafonné à "Difficile" quel que soit votre choix.
+            </p>
+          )}
           <p style={{ fontSize: 14, color: '#64748b', marginBottom: 16 }}>À quel point ce rappel était-il facile ?</p>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
             <button style={{ background: '#fee2e2', color: '#b91c1c', border: 'none', padding: '14px 8px', borderRadius: 10, fontWeight: 600, cursor: 'pointer' }} onClick={() => handleGradeSelect('hard')}>Difficile</button>
