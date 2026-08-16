@@ -208,6 +208,7 @@ export default function App() {
   });
   const [noMoreToday, setNoMoreToday] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showDuplicates, setShowDuplicates] = useState(false);
   const [dailyLesson, setDailyLesson] = useState(null);
   const [lessonIndex, setLessonIndex] = useState(0);
   const [lessonScratch, setLessonScratch] = useState('');
@@ -345,6 +346,20 @@ export default function App() {
       await deleteDoc(doc(ref, card.id));
     }
     setImportMsg('Toutes les fiches ont été supprimées. Vous pouvez importer un nouveau fichier.');
+  };
+
+  const normalizeName = (name) => (name || '').toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+  // Manual, single-card deletion only — never automatic. The user reviews each duplicate
+  // pair (definition, progression already acquired, links) before deciding which to remove.
+  const handleDeleteOne = async (card) => {
+    const hasProgress = card.firstSeenAt || (card.totalReviews || 0) > 0;
+    const warning = hasProgress
+      ? `Supprimer "${card.nom}" (${card.id}) ? Cette fiche a déjà de la progression enregistrée (${card.totalReviews || 0} révision(s)) — elle sera définitivement perdue.`
+      : `Supprimer "${card.nom}" (${card.id}) ?`;
+    if (!window.confirm(warning)) return;
+    const ref = collection(db, 'users', user.uid, 'cards');
+    await deleteDoc(doc(ref, card.id));
   };
 
   // Fixed: explicit UTF-8 decoding + error handling + immediate feedback while the
@@ -601,11 +616,58 @@ export default function App() {
           <h1 style={s.h1}>TLKB Engine</h1>
           <p style={{ fontSize: 12, color: '#64748b', margin: '4px 0 0' }}>{cards.length} fiche(s) en base</p>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button style={s.btnGhost} onClick={() => setShowHistory(!showHistory)}>{showHistory ? 'Retour' : 'Historique'}</button>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button style={s.btnGhost} onClick={() => { setShowHistory(!showHistory); setShowDuplicates(false); }}>{showHistory ? 'Retour' : 'Historique'}</button>
+          <button style={s.btnGhost} onClick={() => { setShowDuplicates(!showDuplicates); setShowHistory(false); }}>{showDuplicates ? 'Retour' : 'Doublons'}</button>
           <button style={s.btnGhost} onClick={() => signOut(auth)}>Déconnexion</button>
         </div>
       </div>
+
+      {showDuplicates && (() => {
+        const groups = {};
+        cards.forEach((c) => {
+          const key = normalizeName(c.nom);
+          if (!key) return;
+          if (!groups[key]) groups[key] = [];
+          groups[key].push(c);
+        });
+        const dupGroups = Object.values(groups).filter((g) => g.length > 1);
+        const fmtDate = (ts) => ts ? new Date(ts).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: '2-digit' }) : '—';
+
+        return (
+          <div style={s.card}>
+            <h3 style={{ marginTop: 0 }}>Doublons potentiels par nom</h3>
+            <p style={{ fontSize: 12, color: '#64748b', marginTop: -8, marginBottom: 16 }}>
+              {dupGroups.length === 0
+                ? "Aucun nom identique détecté — attention, ceci ne détecte pas les synonymes ou variantes orthographiques."
+                : `${dupGroups.length} nom(s) trouvé(s) en plusieurs exemplaires. Rien n'est supprimé automatiquement — vérifiez chaque cas avant de décider.`}
+            </p>
+            {dupGroups.map((group, gi) => (
+              <div key={gi} style={{ border: '1px solid #fecaca', borderRadius: 10, padding: 12, marginBottom: 12 }}>
+                {group.map((c) => (
+                  <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, padding: '8px 0', borderBottom: '1px solid #f1f5f9' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 700 }}>{c.nom} <span style={{ fontWeight: 400, color: '#94a3b8', fontSize: 12 }}>({c.id})</span></div>
+                      <div style={{ fontSize: 11, color: '#64748b', margin: '2px 0' }}>{c.type} · {c.domaine || '—'} {c.sous_domaine ? `· ${c.sous_domaine}` : ''}</div>
+                      <div style={{ fontSize: 12, color: '#334155', margin: '4px 0' }}>{c.definition}</div>
+                      <div style={{ fontSize: 11, color: '#94a3b8' }}>
+                        {c.firstSeenAt ? `Découverte le ${fmtDate(c.firstSeenAt)} · ${c.totalReviews || 0} révision(s)` : 'Jamais étudiée'}
+                        {c.liens ? ` · liée à : ${c.liens}` : ''}
+                      </div>
+                    </div>
+                    <button
+                      style={{ background: '#fee2e2', color: '#b91c1c', border: 'none', padding: '8px 12px', borderRadius: 8, fontWeight: 600, fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}
+                      onClick={() => handleDeleteOne(c)}
+                    >
+                      Supprimer
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        );
+      })()}
 
       {showHistory && (() => {
         const TYPE_LABELS = {
@@ -670,7 +732,7 @@ export default function App() {
         );
       })()}
 
-      {!currentCard && !dailyLesson && !showHistory && (
+      {!currentCard && !dailyLesson && !showHistory && !showDuplicates && (
         <>
           {cards.length > 0 && (() => {
             const total = cards.length;
