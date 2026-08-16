@@ -178,6 +178,7 @@ export default function App() {
   const [cards, setCards] = useState([]);
   const [rawCsv, setRawCsv] = useState('');
   const [importMsg, setImportMsg] = useState('');
+  const [importing, setImporting] = useState(false);
 
   const [currentCard, setCurrentCard] = useState(null);
   const [mode, setMode] = useState(null);
@@ -265,23 +266,45 @@ export default function App() {
     catch (err) { setAuthError(err.message); }
   };
 
+  // Rewritten: parallel batches instead of one-write-at-a-time, with progress feedback,
+  // and a final report distinguishing new vs updated fiches, plus a per-type breakdown.
   const importText = async (text) => {
     if (!text.trim() || !user) return;
     const parsed = parseCsv(text);
     if (parsed.length === 0) { setImportMsg("Aucune fiche valide détectée. Vérifiez l'en-tête et les colonnes."); return; }
+
+    setImporting(true);
+    setImportMsg(`Import en cours… 0 / ${parsed.length}`);
     const ref = collection(db, 'users', user.uid, 'cards');
-    let count = 0;
-    for (const card of parsed) {
-      const existing = cards.find((c) => c.id === card.id);
-      await setDoc(doc(ref, card.id), {
-        ...card,
-        level: existing ? existing.level : 0,
-        confidence: existing ? existing.confidence : 0,
-        nextReview: existing ? existing.nextReview : 0,
-      }, { merge: true });
-      count++;
+    let newCount = 0;
+    let updatedCount = 0;
+    const typeCounts = {};
+    const BATCH_SIZE = 20;
+
+    try {
+      for (let i = 0; i < parsed.length; i += BATCH_SIZE) {
+        const batch = parsed.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map(async (card) => {
+          const existing = cards.find((c) => c.id === card.id);
+          if (existing) updatedCount++; else newCount++;
+          typeCounts[card.type] = (typeCounts[card.type] || 0) + 1;
+          await setDoc(doc(ref, card.id), {
+            ...card,
+            level: existing ? existing.level : 0,
+            confidence: existing ? existing.confidence : 0,
+            nextReview: existing ? existing.nextReview : 0,
+          }, { merge: true });
+        }));
+        setImportMsg(`Import en cours… ${Math.min(i + BATCH_SIZE, parsed.length)} / ${parsed.length}`);
+      }
+      const typeSummary = Object.entries(typeCounts).map(([t, n]) => `${t} : ${n}`).join(' · ');
+      setImportMsg(`✓ ${parsed.length} fiche(s) traitée(s) — ${newCount} nouvelle(s), ${updatedCount} mise(s) à jour (doublon d'ID). Détail : ${typeSummary}`);
+    } catch (e) {
+      console.error('Erreur import', e);
+      setImportMsg(`✗ Erreur pendant l'import : ${e.message || e}. Certaines fiches ont peut-être déjà été importées avant l'échec — vérifiez l'Historique.`);
+    } finally {
+      setImporting(false);
     }
-    setImportMsg(`${count} fiche(s) importée(s) avec succès.`);
     setRawCsv('');
   };
 
@@ -301,12 +324,16 @@ export default function App() {
     setImportMsg('Toutes les fiches ont été supprimées. Vous pouvez importer un nouveau fichier.');
   };
 
+  // Fixed: explicit UTF-8 decoding + error handling + immediate feedback while the
+  // (potentially large, multi-hundred-line) file is being read, before the import even starts.
   const handleFileImport = (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    setImportMsg(`Lecture de "${file.name}"…`);
     const reader = new FileReader();
     reader.onload = (ev) => importText(ev.target.result);
-    reader.readAsText(file);
+    reader.onerror = () => setImportMsg("Impossible de lire ce fichier. Réessayez, ou copiez-collez son contenu dans la zone de texte à la place.");
+    reader.readAsText(file, 'UTF-8');
     e.target.value = '';
   };
 
@@ -765,13 +792,16 @@ export default function App() {
               placeholder="Collez ici le CSV avec sa ligne d'en-tête..."
               value={rawCsv}
               onChange={(e) => setRawCsv(e.target.value)}
+              disabled={importing}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12, alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-              <label style={{ ...s.btnGhost, cursor: 'pointer' }}>
+              <label style={{ ...s.btnGhost, cursor: importing ? 'not-allowed' : 'pointer', opacity: importing ? 0.5 : 1 }}>
                 Importer un fichier .csv
-                <input type="file" accept=".csv,text/csv" onChange={handleFileImport} style={{ display: 'none' }} />
+                <input type="file" accept=".csv,text/csv" onChange={handleFileImport} style={{ display: 'none' }} disabled={importing} />
               </label>
-              <button style={s.btnPrimary} onClick={handleImport}>Importer le texte collé</button>
+              <button style={{ ...s.btnPrimary, opacity: importing ? 0.6 : 1 }} onClick={handleImport} disabled={importing}>
+                {importing ? 'Import en cours…' : 'Importer le texte collé'}
+              </button>
             </div>
             {importMsg && <div style={{ fontSize: 13, color: '#64748b', marginTop: 10 }}>{importMsg}</div>}
           </div>
