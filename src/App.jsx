@@ -46,7 +46,7 @@ function levenshtein(a, b) {
   return m[nb.length][na.length];
 }
 
-function parseCsvLine(line) {
+function parseCsvLine(line, delimiter) {
   const out = [];
   let cell = '';
   let inQ = false;
@@ -54,11 +54,26 @@ function parseCsvLine(line) {
     const c = line[i];
     if (c === '"' && line[i + 1] === '"') { cell += '"'; i++; }
     else if (c === '"') inQ = !inQ;
-    else if (c === ',' && !inQ) { out.push(cell); cell = ''; }
+    else if (c === delimiter && !inQ) { out.push(cell); cell = ''; }
     else cell += c;
   }
   out.push(cell);
   return out;
+}
+
+// French-locale spreadsheet apps (Numbers, Excel) often export CSV with ';' instead of ',',
+// since ',' is the decimal separator in French. A direct copy-paste from a spreadsheet also
+// commonly produces tab-separated values. Detect the real delimiter from the header line
+// instead of assuming a comma, so imports work regardless of the source.
+function detectDelimiter(headerLine) {
+  const candidates = [',', ';', '\t'];
+  let best = ',';
+  let bestCount = -1;
+  for (const d of candidates) {
+    const count = headerLine.split(d).length - 1;
+    if (count > bestCount) { bestCount = count; best = d; }
+  }
+  return best;
 }
 
 const COLUMNS = [
@@ -70,8 +85,9 @@ const COLUMNS = [
 function parseCsv(text) {
   const lines = text.split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.trim() !== '');
   if (lines.length < 2) return [];
+  const delimiter = detectDelimiter(lines[0]);
   return lines.slice(1).map((line) => {
-    const cols = parseCsvLine(line);
+    const cols = parseCsvLine(line, delimiter);
     if (cols.length < 19) return null;
     const card = {};
     COLUMNS.forEach((key, idx) => { card[key] = (cols[idx] || '').trim(); });
@@ -271,7 +287,14 @@ export default function App() {
   const importText = async (text) => {
     if (!text.trim() || !user) return;
     const parsed = parseCsv(text);
-    if (parsed.length === 0) { setImportMsg("Aucune fiche valide détectée. Vérifiez l'en-tête et les colonnes."); return; }
+    if (parsed.length === 0) {
+      const lines = text.split('\n').filter((l) => l.trim() !== '');
+      const delimiter = lines.length ? detectDelimiter(lines[0]) : ',';
+      const delimLabel = { ',': 'virgule', ';': 'point-virgule', '\t': 'tabulation' }[delimiter] || delimiter;
+      const gotCols = lines.length > 1 ? parseCsvLine(lines[1], delimiter).length : 0;
+      setImportMsg(`Aucune fiche valide détectée (séparateur détecté : ${delimLabel}, ${gotCols} colonne(s) trouvée(s) au lieu de 19). Vérifiez que le fichier contient bien l'en-tête et les 19 colonnes attendues.`);
+      return;
+    }
 
     setImporting(true);
     setImportMsg(`Import en cours… 0 / ${parsed.length}`);
